@@ -1,0 +1,998 @@
+/**
+ * 3Dee PRO Cloud Backend
+ * Google Apps Script + Google Sheets
+ *
+ * 1. Run setupDatabase() once from the Apps Script editor.
+ * 2. Add the supplied frontend as an Apps Script HTML file named "Index".
+ * 3. Deploy as a Web app: Execute as "Me", access "Anyone".
+ *
+ * The same deployment also accepts JSON POST requests from an externally
+ * hosted copy of the frontend.
+ */
+
+const APP = Object.freeze({
+  NAME: '3Dee PRO',
+  VERSION: 3,
+  TIME_ZONE: 'Europe/Bratislava',
+  SESSION_DAYS: 7,
+  PASSWORD_ITERATIONS: 7000,
+  MAX_ITEMS: 5000,
+  MAX_DATA_BYTES: 4 * 1024 * 1024,
+  MAX_QUOTE_ITEMS: 60,
+  LOGIN_ATTEMPTS: 6,
+  LOGIN_LOCK_MINUTES: 20
+});
+
+const SHEET_NAMES = Object.freeze({
+  USERS: 'Users',
+  SESSIONS: 'Sessions',
+  DATA: 'UserData',
+  QUOTES: 'Quotes'
+});
+
+const HEADERS = Object.freeze({
+  Users: [
+    'userId', 'displayName', 'email', 'passwordSalt', 'passwordHash',
+    'passwordIterations', 'status', 'failedAttempts', 'lockedUntil',
+    'createdAt', 'updatedAt', 'lastLoginAt'
+  ],
+  Sessions: [
+    'sessionId', 'tokenHash', 'userId', 'createdAt', 'expiresAt',
+    'lastSeenAt', 'revokedAt'
+  ],
+  UserData: ['userId', 'revision', 'chunkIndex', 'chunkCount', 'dataChunk', 'updatedAt'],
+  Quotes: [
+    'quoteId', 'userId', 'quoteNumber', 'customerName', 'customerEmail',
+    'itemIdsJson', 'subtotal', 'discount', 'shipping', 'vatRate', 'total',
+    'currency', 'createdAt', 'fileName', 'metadataJson'
+  ]
+});
+
+class ApiError extends Error {
+  constructor(code, message, details) {
+    super(message);
+    this.name = 'ApiError';
+    this.code = code || 'BAD_REQUEST';
+    this.details = details || null;
+  }
+}
+
+function doGet(e) {
+  if (e && e.parameter && e.parameter.mode === 'health') {
+    return jsonOutput_({
+      ok: true,
+      data: { app: APP.NAME, version: APP.VERSION, time: new Date().toISOString() }
+    });
+  }
+
+  try {
+    return HtmlService.createTemplateFromFile('Index')
+      .evaluate()
+      .setTitle('3Dee PRO')
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  } catch (error) {
+    return HtmlService.createHtmlOutput(
+      '<h2>3Dee PRO backend je pripravený.</h2>' +
+      '<p>Pridajte frontend ako HTML súbor s názvom <strong>Index</strong>, alebo použite túto URL v externej verzii aplikácie.</p>'
+    );
+  }
+}
+
+function doPost(e) {
+  let request = {};
+  try {
+    const raw = e && e.postData && e.postData.contents ? e.postData.contents : '{}';
+    request = JSON.parse(raw);
+  } catch (error) {
+    return jsonOutput_({ ok: false, error: { code: 'INVALID_JSON', message: 'Neplatná JSON požiadavka.' } });
+  }
+  return jsonOutput_(api(request));
+}
+
+/** Callable from google.script.run when the frontend is hosted by Apps Script. */
+function api(request) {
+  try {
+    const action = cleanString_(request && request.action, 50).toLowerCase();
+    const payload = request && typeof request.payload === 'object' && request.payload ? request.payload : {};
+    const token = cleanString_(request && request.token, 500);
+
+    switch (action) {
+      case 'health':
+        return success_({ app: APP.NAME, version: APP.VERSION, time: new Date().toISOString() });
+      case 'register':
+        return success_(registerUser_(payload));
+      case 'login':
+        return success_(loginUser_(payload));
+      case 'resume':
+        return success_(resumeSession_(token));
+      case 'logout':
+        return success_(logoutSession_(token));
+      case 'load-data':
+        return success_(loadDataAction_(token));
+      case 'save-data':
+        return success_(saveDataAction_(token, payload));
+      case 'generate-quote-pdf':
+        return success_(generateQuotePdfAction_(token, payload));
+      default:
+        throw new ApiError('UNKNOWN_ACTION', 'Neznáma operácia.');
+    }
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : error);
+    if (error instanceof ApiError) {
+      return { ok: false, error: { code: error.code, message: error.message, details: error.details } };
+    }
+    return { ok: false, error: { code: 'SERVER_ERROR', message: 'Server požiadavku nedokázal spracovať.' } };
+  }
+}
+
+/** Run once manually. Creates the database and required sheets. */
+function setupDatabase() {
+  const properties = PropertiesService.getScriptProperties();
+  let spreadsheetId = properties.getProperty('SPREADSHEET_ID');
+  let spreadsheet;
+
+  if (spreadsheetId) {
+    spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  } else {
+    const active = SpreadsheetApp.getActiveSpreadsheet();
+    spreadsheet = active || SpreadsheetApp.create('3Dee PRO Database');
+    spreadsheetId = spreadsheet.getId();
+    properties.setProperty('SPREADSHEET_ID', spreadsheetId);
+  }
+
+  if (!properties.getProperty('APP_SECRET')) {
+    properties.setProperty('APP_SECRET', randomToken_(64));
+  }
+  if (!properties.getProperty('PASSWORD_PEPPER')) {
+    properties.setProperty('PASSWORD_PEPPER', randomToken_(48));
+  }
+
+  Object.keys(HEADERS).forEach(function(name) {
+    ensureSheet_(spreadsheet, name, HEADERS[name]);
+  });
+
+  spreadsheet.setSpreadsheetTimeZone(APP.TIME_ZONE);
+  return {
+    spreadsheetId: spreadsheetId,
+    spreadsheetUrl: spreadsheet.getUrl(),
+    message: 'Databáza 3Dee PRO je pripravená.'
+  };
+}
+
+/** Optional maintenance function. Can be attached to a daily trigger. */
+function cleanupExpiredSessions() {
+  const sheet = getSheet_(SHEET_NAMES.SESSIONS);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const now = Date.now();
+  const values = sheet.getRange(2, 1, lastRow - 1, HEADERS.Sessions.length).getValues();
+  const rowsToDelete = [];
+  values.forEach(function(row, index) {
+    const expires = new Date(row[4]).getTime();
+    const revoked = row[6] ? new Date(row[6]).getTime() : 0;
+    if ((expires && expires < now - 7 * 86400000) || (revoked && revoked < now - 7 * 86400000)) {
+      rowsToDelete.push(index + 2);
+    }
+  });
+  rowsToDelete.reverse().forEach(function(rowNumber) { sheet.deleteRow(rowNumber); });
+  return rowsToDelete.length;
+}
+
+function registerUser_(payload) {
+  enforceRateLimit_('register:' + normalizeEmail_(payload.email), 4, 3600);
+
+  const name = cleanString_(payload.name, 80);
+  const email = normalizeEmail_(payload.email);
+  const password = String(payload.password || '');
+
+  if (name.length < 2) throw new ApiError('INVALID_NAME', 'Meno musí mať aspoň 2 znaky.');
+  if (!isValidEmail_(email)) throw new ApiError('INVALID_EMAIL', 'Zadajte platnú e-mailovú adresu.');
+  validatePassword_(password);
+  const salt = Utilities.base64Encode(randomBytes_());
+  const passwordHash = passwordHash_(password, salt, APP.PASSWORD_ITERATIONS);
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const users = getSheet_(SHEET_NAMES.USERS);
+    if (findRowByExact_(users, 3, email)) {
+      throw new ApiError('EMAIL_EXISTS', 'Účet s touto e-mailovou adresou už existuje.');
+    }
+
+    const now = new Date().toISOString();
+    const userId = Utilities.getUuid();
+    users.appendRow([
+      userId, sheetSafeText_(name), email, salt, passwordHash, APP.PASSWORD_ITERATIONS,
+      'active', 0, '', now, now, now
+    ]);
+
+    const initialSettings = sanitizeSettings_({
+      profile: { companyName: name, companyEmail: email }
+    });
+    writeUserData_(userId, 1, { version: APP.VERSION, settings: initialSettings, items: [] }, now);
+
+    const session = issueSession_(userId);
+    return {
+      token: session.token,
+      user: publicUser_({ userId: userId, displayName: name, email: email, createdAt: now }),
+      revision: 1,
+      data: { version: APP.VERSION, settings: initialSettings, items: [], updatedAt: now }
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function loginUser_(payload) {
+  const email = normalizeEmail_(payload.email);
+  const password = String(payload.password || '');
+  enforceRateLimit_('login:' + email, 12, 900);
+
+  if (!isValidEmail_(email) || !password) {
+    throw new ApiError('INVALID_CREDENTIALS', 'Nesprávny e-mail alebo heslo.');
+  }
+
+  const users = getSheet_(SHEET_NAMES.USERS);
+  let rowNumber = findRowByExact_(users, 3, email);
+  if (!rowNumber) {
+    Utilities.sleep(250);
+    throw new ApiError('INVALID_CREDENTIALS', 'Nesprávny e-mail alebo heslo.');
+  }
+
+  let row = users.getRange(rowNumber, 1, 1, HEADERS.Users.length).getValues()[0];
+  let user = userFromRow_(row);
+  if (user.status !== 'active') throw new ApiError('ACCOUNT_DISABLED', 'Tento účet nie je aktívny.');
+
+  const lockedUntil = user.lockedUntil ? new Date(user.lockedUntil).getTime() : 0;
+  if (lockedUntil > Date.now()) {
+    throw new ApiError('ACCOUNT_LOCKED', 'Účet je dočasne uzamknutý. Skúste to neskôr.');
+  }
+
+  const candidate = passwordHash_(password, user.passwordSalt, user.passwordIterations);
+  if (!constantTimeEqual_(candidate, user.passwordHash)) {
+    const failureLock = LockService.getScriptLock();
+    failureLock.waitLock(20000);
+    try {
+      rowNumber = findRowByExact_(users, 3, email);
+      if (rowNumber) {
+        row = users.getRange(rowNumber, 1, 1, HEADERS.Users.length).getValues()[0];
+        user = userFromRow_(row);
+        const attempts = Number(user.failedAttempts || 0) + 1;
+        const lockUntil = attempts >= APP.LOGIN_ATTEMPTS
+          ? new Date(Date.now() + APP.LOGIN_LOCK_MINUTES * 60000).toISOString()
+          : '';
+        users.getRange(rowNumber, 8, 1, 2).setValues([[attempts, lockUntil]]);
+        users.getRange(rowNumber, 11).setValue(new Date().toISOString());
+      }
+    } finally {
+      failureLock.releaseLock();
+    }
+    throw new ApiError('INVALID_CREDENTIALS', 'Nesprávny e-mail alebo heslo.');
+  }
+
+  const successLock = LockService.getScriptLock();
+  successLock.waitLock(20000);
+  let session;
+  try {
+    rowNumber = findRowByExact_(users, 3, email);
+    if (!rowNumber) throw new ApiError('INVALID_CREDENTIALS', 'Nesprávny e-mail alebo heslo.');
+    row = users.getRange(rowNumber, 1, 1, HEADERS.Users.length).getValues()[0];
+    user = userFromRow_(row);
+    if (user.status !== 'active') throw new ApiError('ACCOUNT_DISABLED', 'Tento účet nie je aktívny.');
+    const now = new Date().toISOString();
+    users.getRange(rowNumber, 8, 1, 2).setValues([[0, '']]);
+    users.getRange(rowNumber, 11, 1, 2).setValues([[now, now]]);
+    session = issueSession_(user.userId);
+  } finally {
+    successLock.releaseLock();
+  }
+
+  const dataRecord = loadUserData_(user.userId);
+  return {
+    token: session.token,
+    user: publicUser_(user),
+    revision: dataRecord.revision,
+    data: dataRecord.data
+  };
+}
+
+function resumeSession_(token) {
+  const auth = authenticate_(token);
+  const dataRecord = loadUserData_(auth.user.userId);
+  return {
+    token: token,
+    user: publicUser_(auth.user),
+    revision: dataRecord.revision,
+    data: dataRecord.data
+  };
+}
+
+function logoutSession_(token) {
+  if (!token) return { loggedOut: true };
+  const tokenHash = sessionTokenHash_(token);
+  const sessions = getSheet_(SHEET_NAMES.SESSIONS);
+  const rowNumber = findRowByExact_(sessions, 2, tokenHash);
+  if (rowNumber) sessions.getRange(rowNumber, 7).setValue(new Date().toISOString());
+  return { loggedOut: true };
+}
+
+function loadDataAction_(token) {
+  const auth = authenticate_(token);
+  const dataRecord = loadUserData_(auth.user.userId);
+  return { revision: dataRecord.revision, data: dataRecord.data, user: publicUser_(auth.user) };
+}
+
+function saveDataAction_(token, payload) {
+  const auth = authenticate_(token);
+  const rawData = payload && payload.data ? payload.data : payload;
+  const serializedLength = JSON.stringify(rawData || {}).length;
+  if (serializedLength > APP.MAX_DATA_BYTES) {
+    throw new ApiError('DATA_TOO_LARGE', 'Používateľské dáta sú príliš veľké.');
+  }
+
+  const cleanData = sanitizeDatabase_(rawData);
+  const expectedRevision = Math.max(0, Math.floor(Number(payload.expectedRevision || 0)));
+  const force = payload.force === true;
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const current = loadUserData_(auth.user.userId);
+    const currentRevision = Number(current.revision || 0);
+    const now = new Date().toISOString();
+
+    if (!force && expectedRevision && currentRevision !== expectedRevision) {
+      throw new ApiError('CONFLICT', 'Dáta boli medzitým zmenené na inom zariadení.', {
+        revision: current.revision,
+        data: current.data
+      });
+    }
+
+    const nextRevision = currentRevision + 1;
+    writeUserData_(auth.user.userId, nextRevision, cleanData, now);
+    return { revision: nextRevision, updatedAt: now };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function generateQuotePdfAction_(token, payload) {
+  const auth = authenticate_(token);
+  enforceRateLimit_('pdf:' + auth.user.userId, 20, 3600);
+
+  const selectedIds = Array.isArray(payload.selectedIds)
+    ? payload.selectedIds.map(function(id) { return cleanString_(id, 120); }).filter(Boolean)
+    : [];
+  const uniqueIds = Array.from(new Set(selectedIds));
+  if (!uniqueIds.length) throw new ApiError('NO_ITEMS', 'Vyberte aspoň jednu zákazku.');
+  if (uniqueIds.length > APP.MAX_QUOTE_ITEMS) throw new ApiError('TOO_MANY_ITEMS', 'Jedna ponuka môže obsahovať najviac ' + APP.MAX_QUOTE_ITEMS + ' položiek.');
+
+  const dataRecord = loadUserData_(auth.user.userId);
+  const itemMap = {};
+  dataRecord.data.items.forEach(function(item) { itemMap[item.id] = item; });
+  const items = uniqueIds.map(function(id) { return itemMap[id]; }).filter(function(item) { return item && item.type === 'print'; });
+  if (!items.length || items.length !== uniqueIds.length) {
+    throw new ApiError('ITEM_NOT_FOUND', 'Niektoré vybrané zákazky už neexistujú alebo nie sú výrobné záznamy.');
+  }
+
+  const quote = sanitizeQuoteRequest_(payload);
+  const profile = sanitizeProfile_(Object.assign({}, dataRecord.data.settings.profile || {}, payload.profile || {}));
+  if (!profile.companyName) profile.companyName = auth.user.displayName;
+  if (!profile.companyEmail) profile.companyEmail = auth.user.email;
+
+  const lineItems = items.map(function(item, index) {
+    const quantity = Math.max(1, Number(item.quantity || 1));
+    const unitPrice = money_(item.unitSalePrice);
+    return {
+      position: index + 1,
+      id: item.id,
+      name: item.name,
+      quantity: quantity,
+      unitPrice: unitPrice,
+      total: money_(unitPrice * quantity)
+    };
+  });
+
+  const subtotal = money_(lineItems.reduce(function(sum, item) { return sum + item.total; }, 0));
+  const discount = Math.min(subtotal, money_(quote.discount));
+  const shipping = money_(quote.shipping);
+  const taxBase = money_(Math.max(0, subtotal - discount) + shipping);
+  const vat = money_(taxBase * quote.vatRate / 100);
+  const total = money_(taxBase + vat);
+
+  const result = createQuotePdf_({
+    user: auth.user,
+    profile: profile,
+    customer: quote.customer,
+    quoteNumber: quote.quoteNumber,
+    issueDate: quote.issueDate,
+    validUntil: quote.validUntil,
+    notes: quote.notes,
+    lineItems: lineItems,
+    subtotal: subtotal,
+    discount: discount,
+    shipping: shipping,
+    vatRate: quote.vatRate,
+    vat: vat,
+    total: total
+  });
+
+  getSheet_(SHEET_NAMES.QUOTES).appendRow([
+    Utilities.getUuid(),
+    auth.user.userId,
+    sheetSafeText_(quote.quoteNumber),
+    sheetSafeText_(quote.customer.name),
+    sheetSafeText_(quote.customer.email),
+    JSON.stringify(uniqueIds),
+    subtotal,
+    discount,
+    shipping,
+    quote.vatRate,
+    total,
+    'EUR',
+    new Date().toISOString(),
+    sheetSafeText_(result.fileName),
+    JSON.stringify({ validUntil: quote.validUntil, notes: quote.notes })
+  ]);
+
+  return {
+    fileName: result.fileName,
+    mimeType: 'application/pdf',
+    base64: result.base64,
+    totals: { subtotal: subtotal, discount: discount, shipping: shipping, vat: vat, total: total }
+  };
+}
+
+function createQuotePdf_(model) {
+  const safeNumber = fileSafe_(model.quoteNumber || 'ponuka');
+  const doc = DocumentApp.create('3Dee PRO - ' + safeNumber);
+  const body = doc.getBody();
+
+  const companyTitle = body.appendParagraph(model.profile.companyName || APP.NAME);
+  companyTitle.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  companyTitle.editAsText().setForegroundColor('#007f9b').setBold(true);
+
+  const quoteTitle = body.appendParagraph('CENOVÁ PONUKA');
+  quoteTitle.setHeading(DocumentApp.ParagraphHeading.HEADING2);
+  quoteTitle.editAsText().setBold(true);
+
+  body.appendParagraph(
+    'Číslo: ' + model.quoteNumber + '\n' +
+    'Dátum vystavenia: ' + formatDate_(model.issueDate) + '\n' +
+    'Platnosť do: ' + formatDate_(model.validUntil)
+  );
+
+  const parties = body.appendTable([
+    ['DODÁVATEĽ', 'ODBERATEĽ'],
+    [partyText_(model.profile, true), partyText_(model.customer, false)]
+  ]);
+  styleHeaderRow_(parties.getRow(0));
+  parties.setBorderColor('#b7c8cd');
+
+  body.appendParagraph('');
+  const rows = [['#', 'Položka', 'Množstvo', 'Cena / ks', 'Spolu']];
+  model.lineItems.forEach(function(item) {
+    rows.push([
+      String(item.position),
+      item.name,
+      String(item.quantity),
+      formatMoney_(item.unitPrice),
+      formatMoney_(item.total)
+    ]);
+  });
+  const itemTable = body.appendTable(rows);
+  styleHeaderRow_(itemTable.getRow(0));
+  itemTable.setBorderColor('#b7c8cd');
+
+  body.appendParagraph('');
+  const totalsRows = [
+    ['Medzisúčet', formatMoney_(model.subtotal)]
+  ];
+  if (model.discount > 0) totalsRows.push(['Zľava', '- ' + formatMoney_(model.discount)]);
+  if (model.shipping > 0) totalsRows.push(['Doprava / balenie', formatMoney_(model.shipping)]);
+  if (model.vatRate > 0) totalsRows.push(['DPH ' + model.vatRate + ' %', formatMoney_(model.vat)]);
+  totalsRows.push(['CELKOM', formatMoney_(model.total)]);
+  const totals = body.appendTable(totalsRows);
+  const finalRow = totals.getRow(totals.getNumRows() - 1);
+  for (let i = 0; i < finalRow.getNumCells(); i++) {
+    finalRow.getCell(i).setBackgroundColor('#e7f8fb');
+    finalRow.getCell(i).editAsText().setBold(true).setForegroundColor('#006b80');
+  }
+  totals.setBorderColor('#b7c8cd');
+
+  if (model.notes) {
+    body.appendParagraph('Poznámka').setHeading(DocumentApp.ParagraphHeading.HEADING3);
+    body.appendParagraph(model.notes);
+  }
+
+  if (model.profile.quoteFooter) {
+    body.appendParagraph('');
+    const footer = body.appendParagraph(model.profile.quoteFooter);
+    footer.editAsText().setFontSize(9).setForegroundColor('#60747a');
+  }
+
+  body.appendParagraph('');
+  const generated = body.appendParagraph('Vygenerované aplikáciou 3Dee PRO · ' + formatDate_(new Date().toISOString()));
+  generated.editAsText().setFontSize(8).setForegroundColor('#7a8d92');
+
+  doc.saveAndClose();
+  Utilities.sleep(350);
+
+  const driveFile = DriveApp.getFileById(doc.getId());
+  const fileName = 'cenova-ponuka-' + safeNumber + '.pdf';
+  const pdf = driveFile.getAs(MimeType.PDF).setName(fileName);
+  const base64 = Utilities.base64Encode(pdf.getBytes());
+  driveFile.setTrashed(true);
+
+  return { fileName: fileName, base64: base64 };
+}
+
+function styleHeaderRow_(row) {
+  for (let i = 0; i < row.getNumCells(); i++) {
+    const cell = row.getCell(i);
+    cell.setBackgroundColor('#0b171d');
+    cell.editAsText().setBold(true).setForegroundColor('#ffffff');
+  }
+}
+
+function partyText_(party, supplier) {
+  const lines = [];
+  if (supplier) {
+    if (party.companyName) lines.push(party.companyName);
+    if (party.companyAddress) lines.push(party.companyAddress);
+    if (party.companyId) lines.push('IČO: ' + party.companyId);
+    if (party.taxId) lines.push('DIČ: ' + party.taxId);
+    if (party.vatId) lines.push('IČ DPH: ' + party.vatId);
+    if (party.companyEmail) lines.push(party.companyEmail);
+    if (party.companyPhone) lines.push(party.companyPhone);
+    if (party.bankAccount) lines.push('IBAN: ' + party.bankAccount);
+  } else {
+    if (party.name) lines.push(party.name);
+    if (party.company) lines.push(party.company);
+    if (party.address) lines.push(party.address);
+    if (party.email) lines.push(party.email);
+    if (party.phone) lines.push(party.phone);
+  }
+  return lines.join('\n') || '—';
+}
+
+function sanitizeQuoteRequest_(payload) {
+  const customer = payload && payload.customer ? payload.customer : {};
+  const quoteNumber = cleanString_(payload.quoteNumber, 60) || defaultQuoteNumber_();
+  const issueDate = validIsoDate_(payload.issueDate) || new Date().toISOString();
+  const validUntil = validIsoDate_(payload.validUntil) || new Date(Date.now() + 14 * 86400000).toISOString();
+  const customerName = cleanString_(customer.name, 120);
+  if (!customerName) throw new ApiError('INVALID_CUSTOMER', 'Zadajte názov alebo meno odberateľa.');
+
+  return {
+    quoteNumber: quoteNumber,
+    issueDate: issueDate,
+    validUntil: validUntil,
+    vatRate: numberInRange_(payload.vatRate, 0, 100, 0),
+    discount: numberInRange_(payload.discount, 0, 100000000, 0),
+    shipping: numberInRange_(payload.shipping, 0, 100000000, 0),
+    notes: cleanMultiline_(payload.notes, 2000),
+    customer: {
+      name: customerName,
+      company: cleanString_(customer.company, 120),
+      address: cleanString_(customer.address, 300),
+      email: cleanString_(customer.email, 160),
+      phone: cleanString_(customer.phone, 80)
+    }
+  };
+}
+
+function defaultQuoteNumber_() {
+  const stamp = Utilities.formatDate(new Date(), APP.TIME_ZONE, 'yyyyMMdd');
+  return 'CP-' + stamp + '-' + Math.floor(1000 + Math.random() * 9000);
+}
+
+function issueSession_(userId) {
+  const token = randomToken_(64);
+  const tokenHash = sessionTokenHash_(token);
+  const now = new Date();
+  const expires = new Date(now.getTime() + APP.SESSION_DAYS * 86400000);
+  getSheet_(SHEET_NAMES.SESSIONS).appendRow([
+    Utilities.getUuid(), tokenHash, userId, now.toISOString(), expires.toISOString(), now.toISOString(), ''
+  ]);
+  return { token: token, expiresAt: expires.toISOString() };
+}
+
+function authenticate_(token) {
+  if (!token || token.length < 20) throw new ApiError('AUTH_REQUIRED', 'Prihlásenie vypršalo. Prihláste sa znova.');
+  const sessions = getSheet_(SHEET_NAMES.SESSIONS);
+  const rowNumber = findRowByExact_(sessions, 2, sessionTokenHash_(token));
+  if (!rowNumber) throw new ApiError('AUTH_REQUIRED', 'Prihlásenie vypršalo. Prihláste sa znova.');
+
+  const row = sessions.getRange(rowNumber, 1, 1, HEADERS.Sessions.length).getValues()[0];
+  if (row[6]) throw new ApiError('AUTH_REQUIRED', 'Relácia bola odhlásená.');
+  const expiresAt = new Date(row[4]).getTime();
+  if (!expiresAt || expiresAt <= Date.now()) throw new ApiError('AUTH_REQUIRED', 'Prihlásenie vypršalo. Prihláste sa znova.');
+
+  const users = getSheet_(SHEET_NAMES.USERS);
+  const userRow = findRowByExact_(users, 1, String(row[2]));
+  if (!userRow) throw new ApiError('AUTH_REQUIRED', 'Používateľský účet neexistuje.');
+  const user = userFromRow_(users.getRange(userRow, 1, 1, HEADERS.Users.length).getValues()[0]);
+  if (user.status !== 'active') throw new ApiError('ACCOUNT_DISABLED', 'Tento účet nie je aktívny.');
+
+  const lastSeen = new Date(row[5]).getTime();
+  if (!lastSeen || Date.now() - lastSeen > 30 * 60000) {
+    sessions.getRange(rowNumber, 6).setValue(new Date().toISOString());
+  }
+  return { user: user, sessionRow: rowNumber };
+}
+
+function loadUserData_(userId) {
+  const sheet = getSheet_(SHEET_NAMES.DATA);
+  const rows = findAllRowsByExact_(sheet, 1, userId);
+  if (!rows.length) {
+    const now = new Date().toISOString();
+    const settings = sanitizeSettings_({});
+    const data = { version: APP.VERSION, settings: settings, items: [] };
+    writeUserData_(userId, 1, data, now);
+    return { revision: 1, data: Object.assign({}, data, { updatedAt: now }) };
+  }
+
+  const values = rows.map(function(rowNumber) {
+    return sheet.getRange(rowNumber, 1, 1, HEADERS.UserData.length).getValues()[0];
+  }).sort(function(a, b) { return Number(a[2]) - Number(b[2]); });
+
+  const revision = Number(values[0][1] || 1);
+  const updatedAt = values[0][5] || new Date().toISOString();
+  const serialized = values.map(function(row) { return String(row[4] || ''); }).join('');
+  let parsed;
+  try {
+    parsed = JSON.parse(serialized || '{}');
+  } catch (error) {
+    throw new ApiError('DATA_CORRUPTED', 'Používateľské dáta sú poškodené. Obnovte ich z JSON zálohy.');
+  }
+  const clean = sanitizeDatabase_(parsed);
+  return {
+    revision: revision,
+    data: { version: APP.VERSION, settings: clean.settings, items: clean.items, updatedAt: updatedAt }
+  };
+}
+
+function writeUserData_(userId, revision, data, updatedAt) {
+  const sheet = getSheet_(SHEET_NAMES.DATA);
+  const serialized = JSON.stringify({
+    version: APP.VERSION,
+    settings: data.settings,
+    items: data.items
+  });
+  const chunkSize = 45000;
+  const chunks = [];
+  for (let offset = 0; offset < serialized.length; offset += chunkSize) {
+    chunks.push(serialized.slice(offset, offset + chunkSize));
+  }
+  if (!chunks.length) chunks.push('{}');
+
+  const existingRows = findAllRowsByExact_(sheet, 1, userId);
+  existingRows.sort(function(a, b) { return b - a; }).forEach(function(rowNumber) {
+    sheet.deleteRow(rowNumber);
+  });
+
+  const rows = chunks.map(function(chunk, index) {
+    return [userId, revision, index, chunks.length, chunk, updatedAt];
+  });
+  const startRow = sheet.getLastRow() + 1;
+  const requiredLastRow = startRow + rows.length - 1;
+  if (sheet.getMaxRows() < requiredLastRow) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), requiredLastRow - sheet.getMaxRows());
+  }
+  sheet.getRange(startRow, 1, rows.length, HEADERS.UserData.length).setValues(rows);
+}
+
+function sanitizeDatabase_(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const sourceItems = Array.isArray(source.items) ? source.items : [];
+  if (sourceItems.length > APP.MAX_ITEMS) throw new ApiError('TOO_MANY_ITEMS', 'Účet obsahuje príliš veľa záznamov.');
+  return {
+    version: APP.VERSION,
+    settings: sanitizeSettings_(source.settings || {}),
+    items: sourceItems.map(sanitizeItem_).filter(Boolean)
+  };
+}
+
+function sanitizeSettings_(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  return {
+    filamentPrice: numberInRange_(source.filamentPrice, 0, 100000, 19),
+    electricityPrice: numberInRange_(source.electricityPrice, 0, 10000, 0.19),
+    printerPower: numberInRange_(source.printerPower, 0, 100000, 120),
+    machineRate: numberInRange_(source.machineRate, 0, 100000, 0),
+    theme: source.theme === 'light' ? 'light' : 'dark',
+    lang: source.lang === 'en' ? 'en' : 'sk',
+    profile: sanitizeProfile_(source.profile || {})
+  };
+}
+
+function sanitizeProfile_(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  return {
+    companyName: cleanString_(source.companyName, 120),
+    companyAddress: cleanMultiline_(source.companyAddress, 300),
+    companyId: cleanString_(source.companyId, 50),
+    taxId: cleanString_(source.taxId, 50),
+    vatId: cleanString_(source.vatId, 50),
+    companyEmail: cleanString_(source.companyEmail, 160),
+    companyPhone: cleanString_(source.companyPhone, 80),
+    bankAccount: cleanString_(source.bankAccount, 80),
+    website: cleanString_(source.website, 160),
+    quoteFooter: cleanMultiline_(source.quoteFooter, 1000)
+  };
+}
+
+function sanitizeItem_(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const type = raw.type === 'other' ? 'other' : 'print';
+  const id = cleanString_(raw.id, 120) || Utilities.getUuid();
+  const name = cleanString_(raw.name, 120) || 'Bez názvu';
+  const status = raw.status === 'cp' ? 'cp' : 'ok';
+  const createdAt = validIsoDate_(raw.createdAt) || new Date().toISOString();
+  const updatedAt = validIsoDate_(raw.updatedAt) || createdAt;
+  const order = numberInRange_(raw.order, -100000000, 100000000, 0);
+
+  if (type === 'other') {
+    return {
+      id: id,
+      type: 'other',
+      status: status,
+      name: name,
+      direction: raw.direction === 'income' ? 'income' : 'expense',
+      amount: money_(numberInRange_(raw.amount, 0, 100000000, 0)),
+      createdAt: createdAt,
+      updatedAt: updatedAt,
+      order: order
+    };
+  }
+
+  const quantity = Math.max(1, Math.round(numberInRange_(raw.quantity, 1, 100000, 1)));
+  const unitWeight = numberInRange_(raw.unitWeight, 0, 100000, 0);
+  const timeMode = raw.timeMode === 'unit' ? 'unit' : 'batch';
+  const enteredMinutes = numberInRange_(raw.enteredMinutes, 0, 100000000, 0);
+  const unitSalePrice = money_(numberInRange_(raw.unitSalePrice, 0, 100000000, 0));
+  const extraCost = money_(numberInRange_(raw.extraCost, 0, 100000000, 0));
+  const snapshot = sanitizeSettings_(raw.pricingSnapshot || {});
+  const totalWeight = unitWeight * quantity;
+  const totalMinutes = timeMode === 'unit' ? enteredMinutes * quantity : enteredMinutes;
+  const material = money_((totalWeight / 1000) * snapshot.filamentPrice);
+  const electricity = money_((totalMinutes / 60) * (snapshot.printerPower / 1000) * snapshot.electricityPrice);
+  const machine = money_((totalMinutes / 60) * snapshot.machineRate);
+
+  return {
+    id: id,
+    type: 'print',
+    status: status,
+    name: name,
+    quantity: quantity,
+    unitWeight: unitWeight,
+    timeMode: timeMode,
+    enteredMinutes: enteredMinutes,
+    unitSalePrice: unitSalePrice,
+    extraCost: extraCost,
+    pricingSnapshot: {
+      filamentPrice: snapshot.filamentPrice,
+      electricityPrice: snapshot.electricityPrice,
+      printerPower: snapshot.printerPower,
+      machineRate: snapshot.machineRate
+    },
+    costs: { material: material, electricity: electricity, machine: machine, extra: extraCost },
+    createdAt: createdAt,
+    updatedAt: updatedAt,
+    order: order
+  };
+}
+
+function passwordHash_(password, saltBase64, iterations) {
+  const pepper = PropertiesService.getScriptProperties().getProperty('PASSWORD_PEPPER');
+  if (!pepper) throw new ApiError('SETUP_REQUIRED', 'Najprv spustite setupDatabase().');
+  const passwordBytes = Utilities.newBlob(String(password) + pepper).getBytes();
+  const saltBytes = Utilities.base64Decode(saltBase64);
+  const block = saltBytes.concat([0, 0, 0, 1]);
+  let u = Utilities.computeHmacSha256Signature(block, passwordBytes);
+  const result = u.map(function(byte) { return byte & 255; });
+
+  for (let i = 1; i < iterations; i++) {
+    u = Utilities.computeHmacSha256Signature(u, passwordBytes);
+    for (let j = 0; j < result.length; j++) result[j] ^= (u[j] & 255);
+  }
+  const signed = result.map(function(byte) { return byte > 127 ? byte - 256 : byte; });
+  return Utilities.base64Encode(signed);
+}
+
+function validatePassword_(password) {
+  if (password.length < 10 || password.length > 200) {
+    throw new ApiError('WEAK_PASSWORD', 'Heslo musí mať aspoň 10 znakov.');
+  }
+  if (!/[a-záäčďéíĺľňóôŕšťúýž]/i.test(password) || !/\d/.test(password)) {
+    throw new ApiError('WEAK_PASSWORD', 'Heslo musí obsahovať písmeno aj číslo.');
+  }
+}
+
+function sessionTokenHash_(token) {
+  const secret = PropertiesService.getScriptProperties().getProperty('APP_SECRET');
+  if (!secret) throw new ApiError('SETUP_REQUIRED', 'Najprv spustite setupDatabase().');
+  return Utilities.base64EncodeWebSafe(
+    Utilities.computeHmacSha256Signature(String(token), secret)
+  ).replace(/=+$/g, '');
+}
+
+function constantTimeEqual_(left, right) {
+  const a = String(left || '');
+  const b = String(right || '');
+  let diff = a.length ^ b.length;
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    const ac = i < a.length ? a.charCodeAt(i) : 0;
+    const bc = i < b.length ? b.charCodeAt(i) : 0;
+    diff |= (ac ^ bc);
+  }
+  return diff === 0;
+}
+
+function userFromRow_(row) {
+  return {
+    userId: String(row[0] || ''),
+    displayName: String(row[1] || ''),
+    email: String(row[2] || ''),
+    passwordSalt: String(row[3] || ''),
+    passwordHash: String(row[4] || ''),
+    passwordIterations: Number(row[5] || APP.PASSWORD_ITERATIONS),
+    status: String(row[6] || 'active'),
+    failedAttempts: Number(row[7] || 0),
+    lockedUntil: row[8] ? String(row[8]) : '',
+    createdAt: row[9] ? String(row[9]) : '',
+    updatedAt: row[10] ? String(row[10]) : '',
+    lastLoginAt: row[11] ? String(row[11]) : ''
+  };
+}
+
+function publicUser_(user) {
+  return {
+    id: user.userId,
+    name: user.displayName,
+    email: user.email,
+    createdAt: user.createdAt
+  };
+}
+
+function getDatabase_() {
+  const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (!id) throw new ApiError('SETUP_REQUIRED', 'Najprv spustite setupDatabase().');
+  return SpreadsheetApp.openById(id);
+}
+
+function getSheet_(name) {
+  const spreadsheet = getDatabase_();
+  const sheet = spreadsheet.getSheetByName(name);
+  if (!sheet) throw new ApiError('SETUP_REQUIRED', 'Chýba databázový hárok ' + name + '. Spustite setupDatabase().');
+  return sheet;
+}
+
+function ensureSheet_(spreadsheet, name, headers) {
+  let sheet = spreadsheet.getSheetByName(name);
+  if (!sheet) sheet = spreadsheet.insertSheet(name);
+  if (sheet.getMaxColumns() < headers.length) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), headers.length - sheet.getMaxColumns());
+  }
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length)
+    .setFontWeight('bold')
+    .setBackground('#0b171d')
+    .setFontColor('#ffffff');
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, headers.length);
+}
+
+function findRowByExact_(sheet, column, value) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  const match = sheet.getRange(2, column, lastRow - 1, 1)
+    .createTextFinder(String(value))
+    .matchEntireCell(true)
+    .findNext();
+  return match ? match.getRow() : 0;
+}
+
+function findAllRowsByExact_(sheet, column, value) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  return sheet.getRange(2, column, lastRow - 1, 1)
+    .createTextFinder(String(value))
+    .matchEntireCell(true)
+    .findAll()
+    .map(function(range) { return range.getRow(); });
+}
+
+function enforceRateLimit_(key, maximum, seconds) {
+  const cache = CacheService.getScriptCache();
+  const safeKey = 'rate:' + Utilities.base64EncodeWebSafe(
+    Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, key)
+  ).slice(0, 40);
+  const current = Number(cache.get(safeKey) || 0) + 1;
+  cache.put(safeKey, String(current), seconds);
+  if (current > maximum) throw new ApiError('RATE_LIMIT', 'Príliš veľa požiadaviek. Skúste to neskôr.');
+}
+
+function randomBytes_() {
+  return Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    Utilities.getUuid() + '|' + Utilities.getUuid() + '|' + Date.now() + '|' + Math.random()
+  );
+}
+
+function randomToken_(minimumLength) {
+  let token = '';
+  while (token.length < minimumLength) {
+    token += Utilities.base64EncodeWebSafe(randomBytes_()).replace(/=+$/g, '');
+  }
+  return token.slice(0, minimumLength);
+}
+
+function cleanString_(value, maxLength) {
+  return String(value == null ? '' : value)
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength || 500);
+}
+
+function cleanMultiline_(value, maxLength) {
+  return String(value == null ? '' : value)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .trim()
+    .slice(0, maxLength || 2000);
+}
+
+function sheetSafeText_(value) {
+  const text = String(value == null ? '' : value);
+  return /^[=+\-@]/.test(text) ? "'" + text : text;
+}
+
+function normalizeEmail_(value) {
+  return cleanString_(value, 160).toLowerCase();
+}
+
+function isValidEmail_(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) && email.length <= 160;
+}
+
+function numberInRange_(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
+function money_(value) {
+  return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+}
+
+function validIsoDate_(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+}
+
+function formatDate_(value) {
+  const date = new Date(value);
+  return Utilities.formatDate(Number.isNaN(date.getTime()) ? new Date() : date, APP.TIME_ZONE, 'dd.MM.yyyy');
+}
+
+function formatMoney_(value) {
+  return money_(value).toFixed(2).replace('.', ',') + ' €';
+}
+
+function fileSafe_(value) {
+  return cleanString_(value, 60).replace(/[^a-zA-Z0-9áäčďéíĺľňóôŕšťúýžÁÄČĎÉÍĹĽŇÓÔŔŠŤÚÝŽ_-]+/g, '-').replace(/-+/g, '-');
+}
+
+function success_(data) {
+  return { ok: true, data: data };
+}
+
+function jsonOutput_(value) {
+  return ContentService.createTextOutput(JSON.stringify(value))
+    .setMimeType(ContentService.MimeType.JSON);
+}
